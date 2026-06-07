@@ -2,7 +2,6 @@ import os
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
@@ -49,9 +48,8 @@ SYSTEM_PROMPT = """შენ ხარ EVET-ის (პროფესიულ�
 
 --- დაფინანსება ---
 სულ: 452025014 ლარი
-დ-ბათა რ-ბა=174, პ-ების რ-ბა=1600, სტ. ჯ.=386175
 წლები: 2020=21819618, 2021=70401488, 2022=104487607, 2023=67691871, 2024=55365466, 2025=87871705, 2026=44387258
-TOP პ-ები: საექთ.=32.1M, ფარმ.=28.8M, საექთ.განათ.=25.8M, კულ.ხელ.=25.8M, IT=15.2M, ელ.=15.0M, ბუღ.=12.7M
+TOP პ-ები: საექთ.=32.1M, ფარმ.=28.8M, კულ.ხელ.=25.8M, IT=15.2M, ელ.=15.0M, ბუღ.=12.7M
 TOP კოლ.: ახ.ტალღა=23.2M, შ.მეს.ზუგდ.=18.0M, აისი=15.6M, ბიზ.ტექ.=15.1M
 
 --- თანამშრომლები ---
@@ -83,27 +81,45 @@ def get_usage(ip: str):
         usage_store[ip] = {"date": today, "voice": 0, "image": 0}
     return usage_store[ip]
 
-async def call_gemini(contents: list) -> str:
-    # გამოყენებულია ახალი gemini-2.5-flash მოდელი
-    url = f"https://generativedecorator.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-    
+async def call_gemini(messages: list) -> str:
+    contents = []
+    for m in messages:
+        role = "user" if m["role"] == "user" else "model"
+        if isinstance(m["content"], list):
+            parts = []
+            for c in m["content"]:
+                if c["type"] == "text":
+                    parts.append({"text": c["text"]})
+                elif c["type"] == "image":
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": c["source"]["media_type"],
+                            "data": c["source"]["data"]
+                        }
+                    })
+            contents.append({"role": role, "parts": parts})
+        else:
+            contents.append({"role": role, "parts": [{"text": str(m["content"])}]})
+
     payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": contents,
-        "systemInstruction": {
-            "parts": [{"text": SYSTEM_PROMPT}]
-        }
+        "generationConfig": {"maxOutputTokens": 1000}
     }
-    
-    async with httpx.AsyncClient(timeout=30) as client:
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key={GEMINI_API_KEY}"
+
+    async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(url, json=payload)
         data = resp.json()
         if resp.status_code != 200:
-            raise Exception(data.get("error", {}).get("message", "Gemini API error"))
-        
+            err = data.get("error", {}).get("message", "Gemini API error")
+            raise Exception(err)
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError):
-            raise Exception("Unexpected response format from Gemini API")
+        except (KeyError, IndexError) as e:
+            raise Exception(f"Unexpected Gemini response: {data}")
+
 
 class Message(BaseModel):
     role: str
@@ -122,21 +138,15 @@ class VoiceRequest(BaseModel):
     transcript: str
     messages: Optional[List[Message]] = []
 
-def transform_history(messages: List[Message]) -> list:
-    gemini_contents = []
-    for m in messages:
-        role = "user" if m.role == "user" else "model"
-        gemini_contents.append({
-            "role": role,
-            "parts": [{"text": m.content}]
-        })
-    return gemini_contents
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    contents = transform_history(req.messages)
-    reply = await call_gemini(contents)
-    return JSONResponse({"reply": reply})
+    try:
+        msgs = [{"role": m.role, "content": m.content} for m in req.messages]
+        reply = await call_gemini(msgs)
+        return JSONResponse({"reply": reply})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/chat-image")
 async def chat_image(req: ImageRequest, request: Request):
@@ -144,26 +154,19 @@ async def chat_image(req: ImageRequest, request: Request):
     usage = get_usage(ip)
     if usage["image"] >= 3:
         return JSONResponse({"error": "დღიური ფოტოს ლიმიტი ამოიწურა (3/3)."}, status_code=429)
-    
-    contents = transform_history(req.messages)
-    question = req.question or "ამ სურათზე რა ინფორმაციაა EVET-ის მონაცემებთან?"
-    
-    image_part = {
-        "inlineData": {
-            "mimeType": req.mediaType,
-            "data": req.imageBase64
-        }
-    }
-    text_part = {"text": question}
-    
-    contents.append({
-        "role": "user",
-        "parts": [image_part, text_part]
-    })
-    
-    reply = await call_gemini(contents)
-    usage["image"] += 1
-    return JSONResponse({"reply": reply, "imageUsed": usage["image"], "imageLimit": 3})
+    try:
+        history = [{"role": m.role, "content": m.content} for m in req.messages]
+        question = req.question or "ამ სურათზე რა ინფორმაციაა EVET-ის მონაცემებთან?"
+        user_content = [
+            {"type": "image", "source": {"type": "base64", "media_type": req.mediaType, "data": req.imageBase64}},
+            {"type": "text", "text": question},
+        ]
+        msgs = history + [{"role": "user", "content": user_content}]
+        reply = await call_gemini(msgs)
+        usage["image"] += 1
+        return JSONResponse({"reply": reply, "imageUsed": usage["image"], "imageLimit": 3})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/chat-voice")
 async def chat_voice(req: VoiceRequest, request: Request):
@@ -171,19 +174,17 @@ async def chat_voice(req: VoiceRequest, request: Request):
     usage = get_usage(ip)
     if usage["voice"] >= 3:
         return JSONResponse({"error": "დღიური ვოისის ლიმიტი ამოიწურა (3/3)."}, status_code=429)
-    
-    contents = transform_history(req.messages)
-    contents.append({
-        "role": "user",
-        "parts": [{"text": f"[ვოის შეტყობინება]: {req.transcript}"}]
-    })
-    
-    reply = await call_gemini(contents)
-    usage["voice"] += 1
-    return JSONResponse({"reply": reply, "transcript": req.transcript, "voiceUsed": usage["voice"], "voiceLimit": 3})
+    try:
+        history = [{"role": m.role, "content": m.content} for m in req.messages]
+        msgs = history + [{"role": "user", "content": f"[ვოის შეტყობინება]: {req.transcript}"}]
+        reply = await call_gemini(msgs)
+        usage["voice"] += 1
+        return JSONResponse({"reply": reply, "transcript": req.transcript, "voiceUsed": usage["voice"], "voiceLimit": 3})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/usage")
-async def usage(request: Request):
+async def usage_check(request: Request):
     ip = request.headers.get("x-forwarded-for", request.client.host)
     u = get_usage(ip)
     return JSONResponse({"voice": u["voice"], "image": u["image"], "limit": 3})
