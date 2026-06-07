@@ -170,4 +170,6 @@ async def usage():
     return {"voice": 0, "image": 0, "limit": 3}
 
 
-app.mount("/", StaticFiles(directory="public", html=True), name="static")
+@app.get("/")
+async def root():
+    return FileResponse("index.html")
