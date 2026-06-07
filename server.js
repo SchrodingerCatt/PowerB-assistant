@@ -197,7 +197,7 @@ app.get("/usage", (req, res) => {
   res.json({ voice: usage.voice, image: usage.image, limit: 3 });
 });
 
-app.get("/", (req, res) => res.send("EVET AI Backend is running"));
+app.use(express.static("public"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on port " + PORT));
