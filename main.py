@@ -107,7 +107,7 @@ async def call_gemini(messages: list) -> str:
         "generationConfig": {"maxOutputTokens": 1000}
     }
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(url, json=payload)
