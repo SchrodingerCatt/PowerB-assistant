@@ -17,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 SYSTEM_PROMPT = """შენ ხარ EVET-ის (პროფესიული განათლების სისტემის) ანალიტიკის AI ასისტენტი.
 შენი ერთადერთი ამოცანაა ქვემოთ მოყვანილ მონაცემებზე დაყრდნობით უპასუხო მომხმარებლის კითხვებს ქართულ ენაზე.
@@ -83,26 +83,27 @@ def get_usage(ip: str):
         usage_store[ip] = {"date": today, "voice": 0, "image": 0}
     return usage_store[ip]
 
-async def call_claude(messages: list) -> str:
+async def call_gemini(contents: list) -> str:
+    # გამოყენებულია ახალი gemini-2.5-flash მოდელი
+    url = f"https://generativedecorator.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    payload = {
+        "contents": contents,
+        "systemInstruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
+        }
+    }
+    
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1000,
-                "system": SYSTEM_PROMPT,
-                "messages": messages,
-            },
-        )
+        resp = await client.post(url, json=payload)
         data = resp.json()
         if resp.status_code != 200:
-            raise Exception(data.get("error", {}).get("message", "API error"))
-        return "".join(b.get("text", "") for b in data["content"])
+            raise Exception(data.get("error", {}).get("message", "Gemini API error"))
+        
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            raise Exception("Unexpected response format from Gemini API")
 
 class Message(BaseModel):
     role: str
@@ -121,10 +122,20 @@ class VoiceRequest(BaseModel):
     transcript: str
     messages: Optional[List[Message]] = []
 
+def transform_history(messages: List[Message]) -> list:
+    gemini_contents = []
+    for m in messages:
+        role = "user" if m.role == "user" else "model"
+        gemini_contents.append({
+            "role": role,
+            "parts": [{"text": m.content}]
+        })
+    return gemini_contents
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    msgs = [{"role": m.role, "content": m.content} for m in req.messages]
-    reply = await call_claude(msgs)
+    contents = transform_history(req.messages)
+    reply = await call_gemini(contents)
     return JSONResponse({"reply": reply})
 
 @app.post("/chat-image")
@@ -133,14 +144,24 @@ async def chat_image(req: ImageRequest, request: Request):
     usage = get_usage(ip)
     if usage["image"] >= 3:
         return JSONResponse({"error": "დღიური ფოტოს ლიმიტი ამოიწურა (3/3)."}, status_code=429)
-    history = [{"role": m.role, "content": m.content} for m in req.messages]
+    
+    contents = transform_history(req.messages)
     question = req.question or "ამ სურათზე რა ინფორმაციაა EVET-ის მონაცემებთან?"
-    user_content = [
-        {"type": "image", "source": {"type": "base64", "media_type": req.mediaType, "data": req.imageBase64}},
-        {"type": "text", "text": question},
-    ]
-    msgs = history + [{"role": "user", "content": user_content}]
-    reply = await call_claude(msgs)
+    
+    image_part = {
+        "inlineData": {
+            "mimeType": req.mediaType,
+            "data": req.imageBase64
+        }
+    }
+    text_part = {"text": question}
+    
+    contents.append({
+        "role": "user",
+        "parts": [image_part, text_part]
+    })
+    
+    reply = await call_gemini(contents)
     usage["image"] += 1
     return JSONResponse({"reply": reply, "imageUsed": usage["image"], "imageLimit": 3})
 
@@ -150,9 +171,14 @@ async def chat_voice(req: VoiceRequest, request: Request):
     usage = get_usage(ip)
     if usage["voice"] >= 3:
         return JSONResponse({"error": "დღიური ვოისის ლიმიტი ამოიწურა (3/3)."}, status_code=429)
-    history = [{"role": m.role, "content": m.content} for m in req.messages]
-    msgs = history + [{"role": "user", "content": f"[ვოის შეტყობინება]: {req.transcript}"}]
-    reply = await call_claude(msgs)
+    
+    contents = transform_history(req.messages)
+    contents.append({
+        "role": "user",
+        "parts": [{"text": f"[ვოის შეტყობინება]: {req.transcript}"}]
+    })
+    
+    reply = await call_gemini(contents)
     usage["voice"] += 1
     return JSONResponse({"reply": reply, "transcript": req.transcript, "voiceUsed": usage["voice"], "voiceLimit": 3})
 
